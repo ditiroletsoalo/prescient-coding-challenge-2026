@@ -48,11 +48,20 @@ import pandas as pd
 # Every tuneable number lives here. Fewer is better.
 # --------------------------------------------------------------------------- #
 
+# On the absent tau: with a single view and the He-Litterman choice of
+# Omega = diag(P (tau Sigma) P'), tau cancels out of the posterior exactly --
+#     middle = tau Sigma P' / (2 tau P Sigma P') = Sigma P' / (2 P Sigma P')
+# -- and a sweep from 0.001 to 10 confirms it to six decimals. Parameter count
+# is scored, so a parameter that provably does nothing is not declared.
 PARAMS = {
-    "vol_days":    250,     # lookback for the volatility estimate
-    "tilt_size":   0.06,    # how far a 1-sigma signal moves a weight
-    "trade_speed": 0.10,    # fraction of the gap to yesterday we close per day
+    "gamma":        4.0,    # risk aversion, in the mutual-fund separation sense
+    "mean_window":  750,    # lookback for expected returns and the macro z-score
+    "view_scale":   0.01,   # view strength (return units) at a 1-sigma VIX reading
+    "tilt_size":    0.12,   # scales the raw optimiser output before make_legal
+    "trade_speed":  0.05,   # fraction of the gap to yesterday we close per day
 }
+
+RIDGE = 1e-6             # regularises the covariance inverse
 
 # The rules, restated locally so this file reads on its own.
 ACTIVE_BAND = 0.10       # per asset, distance from benchmark
@@ -89,19 +98,83 @@ GOLD_CAP = 0.10
 # --------------------------------------------------------------------------- #
 
 
-def build_signal(hist, params) -> pd.Series:
-    """Score per asset. Positive means overweight, negative means underweight.
+def _zscore(series: pd.Series) -> float:
+    """Most recent value of `series`, expressed in its own historical sigmas."""
+    s = series.dropna()
+    if len(s) < 20 or s.std() == 0:
+        return 0.0
+    return float((s.iloc[-1] - s.mean()) / s.std())
 
-    Naive placeholder: inverse volatility. Lower-volatility assets score
-    higher. That is a statement about risk, not about return -- replace it.
+
+def _expected_returns(hist, params) -> np.ndarray:
+    """Expected returns: a time-varying estimate, tilted by one view.
+
+    The prior is the trailing mean return per asset, annualised. This matters
+    more than it looks: an alternative is to reverse-optimise the prior off
+    the benchmark weights, but the benchmark is a CONSTANT vector and the
+    covariance moves slowly, so that prior is very nearly frozen and the
+    resulting portfolio holds the same sign of active position for years at a
+    time. A trailing mean moves, so the portfolio can actually change its mind.
+
+    The view: a VIX spike (risk-off) favours GOLD over GLOBAL_EQUITY, safety
+    over growth, conditioned on where the VIX sits against its own history.
     """
-    vol = hist.returns.tail(int(params["vol_days"])).std() * np.sqrt(252)
-    score = (1.0 / vol.replace(0.0, np.nan)).reindex(hist.assets).fillna(0.0)
+    assets = hist.assets
+    win = int(params["mean_window"])
+    sigma = hist.cov().reindex(index=assets, columns=assets).to_numpy(dtype=float)
+    pi = hist.returns.tail(win).mean().reindex(assets).to_numpy(dtype=float) * 252.0
 
-    # standardise so the signal scale is stable through time
-    if score.std() > 0:
-        score = (score - score.mean()) / score.std()
-    return score
+    macro = hist.macro.tail(win)
+    if len(macro) < 20:
+        return pi
+
+    idx = {a: i for i, a in enumerate(assets)}
+    P = np.zeros((1, len(assets)))
+    P[0, idx["GOLD"]], P[0, idx["GLOBAL_EQUITY"]] = 1.0, -1.0
+    V = np.array([float(params["view_scale"]) * _zscore(macro["vix"])])
+
+    # Black-Litterman posterior in reduced form (see the note above PARAMS).
+    sp = sigma @ P.T
+    psp = P @ sp
+    adj = sp @ np.linalg.solve(2.0 * psp + np.eye(1) * 1e-12, np.eye(1)) @ (V - P @ pi)
+    return pi + adj.ravel()
+
+
+def build_signal(hist, params) -> pd.Series:
+    """The zero-cost active portfolio from the mutual fund separation theorem.
+
+        w_T = (1/gamma) Sigma^-1 ( E[R] - 1 (1' Sigma^-1 E[R]) / (1' Sigma^-1 1) )
+
+    This is an optimiser rather than a per-asset score: Sigma^-1 lets the
+    correlations decide how a view on one asset should be funded out of the
+    others, which a standardised score throws away. It sums to zero by
+    construction, so benchmark + w_T is still fully invested.
+
+    The result is scaled to a sensible active size and then handed to
+    make_legal, which enforces the bands, the budget and the caps.
+    """
+    assets = hist.assets
+    sigma = hist.cov().reindex(index=assets, columns=assets).to_numpy(dtype=float)
+    e_r = _expected_returns(hist, params)
+    n = len(assets)
+
+    s = sigma + np.eye(n) * RIDGE
+    ones = np.ones(n)
+    try:
+        a = np.linalg.solve(s, e_r)
+        b = np.linalg.solve(s, ones)
+    except np.linalg.LinAlgError:
+        return pd.Series(0.0, index=assets)
+
+    denom = float(ones @ b)
+    if not np.isfinite(denom) or abs(denom) < 1e-12:
+        return pd.Series(0.0, index=assets)
+
+    w_t = np.nan_to_num((a - b * float(ones @ a) / denom) / float(params["gamma"]))
+    total = np.abs(w_t).sum()
+    if total > 1e-12:
+        w_t = w_t * (float(params["tilt_size"]) * len(assets) / total)
+    return pd.Series(w_t, index=assets)
 
 
 def make_legal(weights: pd.Series, hist) -> pd.Series:
@@ -161,9 +234,8 @@ def generate_weights(hist, prev_weights, params):
     if len(hist.returns) < 260:
         return bm.to_dict()
 
-    # 1. signal -> target weights around the benchmark
-    signal = build_signal(hist, params)
-    target = make_legal(bm + float(params["tilt_size"]) * signal, hist)
+    # 1. optimiser -> target weights around the benchmark
+    target = make_legal(bm + build_signal(hist, params), hist)
 
     # 2. trade gradually toward the target rather than jumping to it
     prev = prev_weights.reindex(hist.assets)
