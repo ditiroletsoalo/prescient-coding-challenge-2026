@@ -63,7 +63,7 @@ import pandas as pd
 PARAMS = {
     "mean_window":  750,    # lookback for expected returns and the macro z-score
     "view_scale":   0.01,   # view strength (return units) at a 1-sigma VIX reading
-    "tilt_size":    0.20,   # scales the raw optimiser output before make_legal
+    "tilt_size":    0.25,   # scales the raw optimiser output before make_legal
     "trade_speed":  0.02,   # fraction of the gap to yesterday we close per day
 }
 
