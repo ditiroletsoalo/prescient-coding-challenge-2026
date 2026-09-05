@@ -48,17 +48,23 @@ import pandas as pd
 # Every tuneable number lives here. Fewer is better.
 # --------------------------------------------------------------------------- #
 
-# On the absent tau: with a single view and the He-Litterman choice of
+# TWO parameters are absent because they are provably inert here.
+#
+# tau: with a single view and the He-Litterman choice of
 # Omega = diag(P (tau Sigma) P'), tau cancels out of the posterior exactly --
 #     middle = tau Sigma P' / (2 tau P Sigma P') = Sigma P' / (2 P Sigma P')
-# -- and a sweep from 0.001 to 10 confirms it to six decimals. Parameter count
-# is scored, so a parameter that provably does nothing is not declared.
+# -- and a sweep from 0.001 to 10 confirms it to six decimals.
+#
+# gamma: w_T carries a 1/gamma factor, but the result is then rescaled to a
+# fixed total absolute active size, and the factor cancels in that rescaling.
+# Swept 0.5 to 50 with identical weights to eight decimals.
+#
+# Parameter count is scored, so neither is declared.
 PARAMS = {
-    "gamma":        4.0,    # risk aversion, in the mutual-fund separation sense
     "mean_window":  750,    # lookback for expected returns and the macro z-score
     "view_scale":   0.01,   # view strength (return units) at a 1-sigma VIX reading
-    "tilt_size":    0.12,   # scales the raw optimiser output before make_legal
-    "trade_speed":  0.05,   # fraction of the gap to yesterday we close per day
+    "tilt_size":    0.20,   # scales the raw optimiser output before make_legal
+    "trade_speed":  0.02,   # fraction of the gap to yesterday we close per day
 }
 
 RIDGE = 1e-6             # regularises the covariance inverse
@@ -170,7 +176,8 @@ def build_signal(hist, params) -> pd.Series:
     if not np.isfinite(denom) or abs(denom) < 1e-12:
         return pd.Series(0.0, index=assets)
 
-    w_t = np.nan_to_num((a - b * float(ones @ a) / denom) / float(params["gamma"]))
+    # (no 1/gamma factor: it cancels in the rescaling below -- see note above)
+    w_t = np.nan_to_num(a - b * float(ones @ a) / denom)
     total = np.abs(w_t).sum()
     if total > 1e-12:
         w_t = w_t * (float(params["tilt_size"]) * len(assets) / total)
